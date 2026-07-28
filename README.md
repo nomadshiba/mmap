@@ -81,16 +81,69 @@ chunk.advise(Advice.Sequential); // full scan — aggressive read-ahead
 
 `advise` is a no-op on Windows (no direct `madvise` equivalent); it never affects correctness, only kernel heuristics.
 
+### Pointer sharing
+
+By default, mapping the same absolute file path again — with the same `write`/`offset`/`length` — hands back the _same_ mapping (same `pointer`, same
+`bytes`/`view`) instead of calling `mmap()` again, refcounted so it's only actually unmapped once every handle sharing it has been closed. This is automatic,
+requires no setup, and applies within a single isolate/thread:
+
+```ts
+import { Mmap } from "jsr:@nomadshiba/mmap";
+
+using a = await Mmap.open("data.bin");
+using b = await Mmap.open("data.bin"); // same file → same pointer, no second mmap() call
+a.pointer === b.pointer; // (well — same address; compare via Deno.UnsafePointer.value)
+```
+
+Pass a distinct `key` to opt a call out of that sharing and get an independent mapping of the same file instead:
+
+```ts
+import { Mmap } from "jsr:@nomadshiba/mmap";
+
+using a = await Mmap.open("data.bin", { key: "reader-a" });
+using b = await Mmap.open("data.bin", { key: "reader-b" }); // independent mapping, different pointer
+```
+
+Opening the same path again with _different_ `write`/`offset`/`length` than an already-open mapping for that path + `key` throws — use a different `key` if you
+actually want a second, independent mapping.
+
+A `Worker` is a separate V8 isolate with its own copy of this module's state, so the automatic, same-isolate sharing above is invisible between a main thread
+and its workers (each would still call `mmap()` itself, getting its own pointer). To share the exact same pointer across workers too, create an `MmapRegistry`,
+send its `.buffer` to each worker, and pass it as `{ registry }`:
+
+```ts
+// main.ts
+import { Mmap, MmapRegistry } from "jsr:@nomadshiba/mmap";
+
+const registry = MmapRegistry.create();
+const worker = new Worker(new URL("./worker.ts", import.meta.url).href, { type: "module" });
+worker.postMessage({ buffer: registry.buffer });
+
+using f = await Mmap.open("data.bin", { registry });
+```
+
+```ts ignore
+// worker.ts
+import { Mmap, MmapRegistry } from "jsr:@nomadshiba/mmap";
+
+self.onmessage = async (e) => {
+	const registry = MmapRegistry.from(e.data.buffer);
+	using f = await Mmap.open("data.bin", { registry }); // same pointer as main.ts's `f`
+};
+```
+
 ## API
 
 ### `Mmap.open(path, options?): Promise<Mmap>` / `Mmap.openSync(path, options?): Mmap`
 
-| option   | type               | default              | meaning                                                                            |
-| -------- | ------------------ | -------------------- | ---------------------------------------------------------------------------------- |
-| `write`  | `boolean`          | `false`              | Map read-write (`MAP_SHARED`). Needs `--allow-write`.                              |
-| `offset` | `number \| bigint` | `0`                  | Start offset into the file (any value; auto-aligned).                              |
-| `length` | `number \| bigint` | file size − `offset` | Bytes to map.                                                                      |
-| `size`   | `number \| bigint` | —                    | Ensure the file is at least this large. Requires `write: true` — throws otherwise. |
+| option     | type               | default              | meaning                                                                                              |
+| ---------- | ------------------ | -------------------- | ---------------------------------------------------------------------------------------------------- |
+| `write`    | `boolean`          | `false`              | Map read-write (`MAP_SHARED`). Needs `--allow-write`.                                                |
+| `offset`   | `number \| bigint` | `0`                  | Start offset into the file (any value; auto-aligned).                                                |
+| `length`   | `number \| bigint` | file size − `offset` | Bytes to map.                                                                                        |
+| `size`     | `number \| bigint` | —                    | Ensure the file is at least this large. Requires `write: true` — throws otherwise.                   |
+| `key`      | `string`           | `""`                 | Distinguishes this mapping from others of the _same file_ (see [Pointer sharing](#pointer-sharing)). |
+| `registry` | `MmapRegistry`     | —                    | Extends pointer sharing across `Worker` threads (see [Pointer sharing](#pointer-sharing)).           |
 
 ### `class Mmap`
 
@@ -109,6 +162,14 @@ chunk.advise(Advice.Sequential); // full scan — aggressive read-ahead
 ### `enum Advice`
 
 `Normal`, `Random`, `Sequential`, `WillNeed`, `DontNeed`.
+
+### `class MmapRegistry`
+
+| member                          | description                                                                                                                   |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `MmapRegistry.create(options?)` | Create a fresh, empty registry. `options.capacity` (default `64`) caps how many distinct (path, `key`) mappings it can track. |
+| `MmapRegistry.from(buffer)`     | Reconstruct a registry from a `SharedArrayBuffer` received from another worker (e.g. via `postMessage`).                      |
+| `.buffer: SharedArrayBuffer`    | Send this (not the `MmapRegistry` instance itself) to other workers.                                                          |
 
 ## Lifecycle — read this
 

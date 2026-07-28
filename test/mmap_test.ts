@@ -84,3 +84,52 @@ Deno.test("use after close throws (guarded getter), close is idempotent", () => 
 	m.close(); // idempotent — no throw, no double-unmap
 	assertThrows(() => m.bytes);
 });
+
+Deno.test("sharing: same path, no key → same pointer, refcounted close", () => {
+	const path = `${tmp}/shared-default.bin`;
+	Deno.writeFileSync(path, new Uint8Array(16));
+
+	const a = Mmap.openSync(path);
+	const b = Mmap.openSync(path);
+	assertEquals(Deno.UnsafePointer.value(a.pointer), Deno.UnsafePointer.value(b.pointer), "same path should share the same pointer");
+	assertEquals(a.bytes.buffer, b.bytes.buffer, "same path should share the same backing buffer");
+
+	a.close();
+	assertEquals(b.bytes.length, 16); // closing `a` must not invalidate sibling handle `b`
+
+	b.close();
+	// Both closed now — a brand-new open() must create a fresh mapping, not reuse a dead one.
+	using c = Mmap.openSync(path);
+	assertEquals(c.length, 16);
+});
+
+Deno.test("sharing: distinct `key` gives an independent mapping of the same file", () => {
+	const path = `${tmp}/shared-keyed.bin`;
+	Deno.writeFileSync(path, new Uint8Array(16));
+
+	using a = Mmap.openSync(path, { key: "a" });
+	using b = Mmap.openSync(path, { key: "b" });
+	using c = Mmap.openSync(path, { key: "a" });
+
+	assert(
+		Deno.UnsafePointer.value(a.pointer) !== Deno.UnsafePointer.value(b.pointer),
+		"different keys should get independent pointers",
+	);
+	assertEquals(Deno.UnsafePointer.value(a.pointer), Deno.UnsafePointer.value(c.pointer), "same key should share the same pointer");
+});
+
+Deno.test("sharing: mismatched options for the same key throws", () => {
+	const path = `${tmp}/shared-mismatch.bin`;
+	Deno.writeFileSync(path, new Uint8Array(4096));
+
+	using a = Mmap.openSync(path); // read-only, whole file
+	assertThrows(
+		() => Mmap.openSync(path, { write: true }),
+		"opening the same path read-write while a read-only mapping is live should throw",
+	);
+	assertThrows(
+		() => Mmap.openSync(path, { length: 10 }),
+		"opening the same path with a different length while a mapping is live should throw",
+	);
+	void a;
+});

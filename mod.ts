@@ -33,3 +33,5 @@
 export { Mmap } from "./src/mmap.ts";
 export type { MmapOptions as MapOptions } from "./src/mmap.ts";
 export { Advice } from "./src/constants.ts";
+export { MmapRegistry } from "./src/registry.ts";
+export type { SharedMappingEntry } from "./src/registry.ts";
