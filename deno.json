@@ -1,9 +1,14 @@
 {
 	"name": "@nomadshiba/mmap",
 	"version": "0.0.1",
+	"license": "LGPL-2.1-or-later",
 	"exports": "./mod.ts",
+	"publish": {
+		"exclude": [".devcontainer", "test"]
+	},
 	"tasks": {
-		"test": "deno test --allow-ffi --allow-read --allow-write"
+		"test": "deno test --allow-ffi --allow-read --allow-write",
+		"test:docs": "deno test --doc --no-run --allow-ffi --allow-read --allow-write"
 	},
 	"fmt": {
 		"lineWidth": 160,

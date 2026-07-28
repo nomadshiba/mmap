@@ -11,14 +11,14 @@
  *
  * @example Read a file with zero copies
  * ```ts
- * import { map } from "@nomadshiba/mmap";
+ * import { Mmap } from "@nomadshiba/mmap";
  * using file = await Mmap.open("massive.bin");
  * console.log(file.bytes[102432]); // faults in a single page
  * ```
  *
  * @example Create, write, flush
  * ```ts
- * import { map } from "@nomadshiba/mmap";
+ * import { Mmap } from "@nomadshiba/mmap";
  * using out = await Mmap.open("out.bin", { write: true, size: 1024 * 1024 });
  * out.bytes[0] = 0xff;
  * out.view.setUint32(4, 0xdeadbeef, true);

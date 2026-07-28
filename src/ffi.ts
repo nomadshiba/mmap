@@ -1,4 +1,4 @@
-import { MAP_PRIVATE, MAP_SHARED, MS_SYNC, O_RDONLY, O_RDWR, PROT_READ, PROT_WRITE } from "./constants.ts";
+import { MAP_SHARED, MS_SYNC, O_RDONLY, O_RDWR, PROT_READ, PROT_WRITE } from "./constants.ts";
 import { os } from "./platform.ts";
 
 // ---------------------------------------------------------------------------
@@ -29,6 +29,46 @@ function failed(p: Deno.PointerValue): boolean {
 	return p === null || FAILURE_PTRS.has(ptrValue(p));
 }
 
+/** Reads the calling thread's `errno` and renders it via `strerror(3)`, e.g. `"Permission denied (errno 13)"`. */
+function errnoMessage(): string | null {
+	if (!posix?.errnoLocation || !posix.strerror) return null;
+	const errnoPtr = posix.errnoLocation();
+	if (errnoPtr === null) return null;
+	const code = new Deno.UnsafePointerView(errnoPtr).getInt32(0);
+	const strPtr = posix.strerror(code);
+	if (strPtr === null) return `errno ${code}`;
+	return `${new Deno.UnsafePointerView(strPtr).getCString()} (errno ${code})`;
+}
+
+/** Renders the last Win32 error via `FormatMessageW`, e.g. `"Access is denied. (Win32 error 5)"`. */
+function win32ErrorMessage(): string | null {
+	if (!win?.GetLastError || !win.FormatMessageW) return null;
+	const code = win.GetLastError();
+	if (code === 0) return null;
+	const FORMAT_MESSAGE_FROM_SYSTEM = 0x1000;
+	const FORMAT_MESSAGE_IGNORE_INSERTS = 0x200;
+	const buf = new Uint8Array(512);
+	const chars = win.FormatMessageW(
+		FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+		null,
+		code,
+		0,
+		buf,
+		256,
+		null,
+	);
+	if (chars === 0) return `Win32 error ${code}`;
+	const u16 = new Uint16Array(buf.buffer, 0, chars);
+	const text = String.fromCharCode(...u16).replace(/[\r\n]+$/, "");
+	return `${text} (Win32 error ${code})`;
+}
+
+/** Appends the platform's last-error detail to `msg`, if one is available. */
+function withLastError(msg: string): string {
+	const detail = os === "windows" ? win32ErrorMessage() : errnoMessage();
+	return detail ? `${msg}: ${detail}` : msg;
+}
+
 // ---------------------------------------------------------------------------
 // POSIX (Linux, macOS)
 // ---------------------------------------------------------------------------
@@ -44,6 +84,14 @@ function openPosix() {
 		madvise: { parameters: ["pointer", "usize", "i32"], result: "i32" },
 		msync: { parameters: ["pointer", "usize", "i32"], result: "i32" },
 		getpagesize: { parameters: [], result: "i32" },
+		strerror: { parameters: ["i32"], result: "pointer", optional: true },
+		// Thread-local errno accessor: `__error` on macOS, `__errno_location` on Linux.
+		errnoLocation: {
+			name: os === "darwin" ? "__error" : "__errno_location",
+			parameters: [],
+			result: "pointer",
+			optional: true,
+		},
 	} as const;
 
 	const candidates = os === "darwin" ? ["libSystem.B.dylib", "libc.dylib", "/usr/lib/libSystem.B.dylib"] : ["libc.so.6", "libc.so"];
@@ -80,6 +128,11 @@ function openWin() {
 		FlushViewOfFile: { parameters: ["pointer", "usize"], result: "i32" },
 		CloseHandle: { parameters: ["pointer"], result: "i32" },
 		GetSystemInfo: { parameters: ["pointer"], result: "void" },
+		GetLastError: { parameters: [], result: "u32" },
+		FormatMessageW: {
+			parameters: ["u32", "pointer", "u32", "u32", "buffer", "u32", "pointer"],
+			result: "u32",
+		},
 	} as const;
 	return Deno.dlopen("kernel32.dll", symbols);
 }
@@ -144,12 +197,14 @@ export function nativeMap(
 ): Deno.PointerObject {
 	if (posix) {
 		const fd = posix.open(cstr(path), write ? O_RDWR : O_RDONLY);
-		if (fd < 0) throw new Error(`open failed: ${path}`);
+		if (fd < 0) throw new Error(withLastError(`open failed: ${path}`));
 		try {
 			const prot = write ? PROT_READ | PROT_WRITE : PROT_READ;
-			const flags = write ? MAP_SHARED : MAP_PRIVATE;
-			const p = posix.mmap(null, mapLength, prot, flags, fd, alignedOffset);
-			if (failed(p)) throw new Error("mmap failed");
+			// MAP_SHARED even when read-only: MAP_PRIVATE leaves visibility of
+			// concurrent writers to the file *unspecified* by POSIX, whereas
+			// MAP_SHARED is a well-defined, coherent view of the page cache.
+			const p = posix.mmap(null, mapLength, prot, MAP_SHARED, fd, alignedOffset);
+			if (failed(p)) throw new Error(withLastError("mmap failed"));
 			return p as Deno.PointerObject;
 		} finally {
 			posix.close(fd); // mapping outlives the fd
@@ -166,7 +221,7 @@ export function nativeMap(
 		FILE_ATTRIBUTE_NORMAL,
 		null,
 	);
-	if (failed(handle)) throw new Error(`CreateFileW failed: ${path}`);
+	if (failed(handle)) throw new Error(withLastError(`CreateFileW failed: ${path}`));
 
 	let mapping: Deno.PointerValue = null;
 	try {
@@ -179,7 +234,7 @@ export function nativeMap(
 			null,
 		);
 		if (mapping === null || ptrValue(mapping) === 0n) {
-			throw new Error("CreateFileMapping failed");
+			throw new Error(withLastError("CreateFileMapping failed"));
 		}
 		const offHigh = Number((alignedOffset >> 32n) & 0xffffffffn) >>> 0;
 		const offLow = Number(alignedOffset & 0xffffffffn) >>> 0;
@@ -191,7 +246,7 @@ export function nativeMap(
 			mapLength,
 		);
 		if (base === null || ptrValue(base) === 0n) {
-			throw new Error("MapViewOfFile failed");
+			throw new Error(withLastError("MapViewOfFile failed"));
 		}
 		return base as Deno.PointerObject;
 	} finally {
@@ -214,12 +269,12 @@ export function nativeUnmap(base: Deno.PointerValue, mapLength: bigint): void {
 export function nativeSync(ptr: Deno.PointerValue, length: bigint): void {
 	if (posix) {
 		if (posix.msync(ptr, length, MS_SYNC) !== 0) {
-			throw new Error("msync failed");
+			throw new Error(withLastError("msync failed"));
 		}
 		return;
 	}
 	if (win!.FlushViewOfFile(ptr, length) === 0) {
-		throw new Error("FlushViewOfFile failed");
+		throw new Error(withLastError("FlushViewOfFile failed"));
 	}
 }
 

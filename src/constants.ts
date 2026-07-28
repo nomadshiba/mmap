@@ -23,7 +23,6 @@ export enum Advice {
 export const PROT_READ = 0x1;
 export const PROT_WRITE = 0x2;
 export const MAP_SHARED = 0x1;
-export const MAP_PRIVATE = 0x2;
 
 // open(2) flags we use. O_RDONLY/O_RDWR are stable across Linux and macOS.
 export const O_RDONLY = 0x0;
