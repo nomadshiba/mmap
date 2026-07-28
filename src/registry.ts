@@ -10,7 +10,7 @@
 //
 // `MmapRegistry` is a tiny fixed-capacity hash table living in a `SharedArrayBuffer`, guarded by a
 // spinlock (`Atomics.compareExchange`), that lets independent isolates agree on "who already mapped
-// this (path, key)" and hand back that exact pointer/length instead of calling `mmap()` again.
+// this (path, key)" and hand back that exact pointer/length instead of mapping the file again.
 //
 // Usage:
 // ```ts
@@ -156,7 +156,7 @@ export class MmapRegistry {
 	/**
 	 * Look up `mapKey` (`` `${absolutePath}\0${key ?? ""}` ``):
 	 * - **Hit** — another mapping already exists; its refcount is bumped and its numeric fields are
-	 *   returned so the caller can reconstruct a view over the *same* memory without calling `mmap()`.
+	 *   returned so the caller can reconstruct a view over the *same* memory without mapping the file again.
 	 * - **Miss** — a slot is reserved (refcount 1) for the caller, who is now responsible for actually
 	 *   mapping the file and calling {@linkcode MmapRegistry.publish} (or {@linkcode MmapRegistry.abort}
 	 *   on failure).
@@ -185,7 +185,7 @@ export class MmapRegistry {
 			}
 
 			// Reserve the slot now (state + refcount + key) so a concurrent acquire() for the same
-			// key — while we're still mmap()-ing — sees a hit instead of also reserving a new slot.
+			// key — while we're still mapping the file — sees a hit instead of also reserving a new slot.
 			const off = this.#slotOffset(freeSlot);
 			this.#view.setInt32(off, STATE_OCCUPIED);
 			this.#view.setInt32(off + 4, 1);
@@ -209,7 +209,7 @@ export class MmapRegistry {
 		});
 	}
 
-	/** Release a slot reserved by an {@linkcode MmapRegistry.acquire} miss without publishing (e.g. `mmap()` failed). */
+	/** Release a slot reserved by an {@linkcode MmapRegistry.acquire} miss without publishing (e.g. the map call failed). */
 	abort(slot: number): void {
 		this.#withLock(() => {
 			this.#view.setInt32(this.#slotOffset(slot), STATE_EMPTY);

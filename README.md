@@ -84,14 +84,14 @@ chunk.advise(Advice.Sequential); // full scan — aggressive read-ahead
 ### Pointer sharing
 
 By default, mapping the same absolute file path again — with the same `write`/`offset`/`length` — hands back the _same_ mapping (same `pointer`, same
-`bytes`/`view`) instead of calling `mmap()` again, refcounted so it's only actually unmapped once every handle sharing it has been closed. This is automatic,
+`bytes`/`view`) instead of mapping the file again, refcounted so it's only actually unmapped once every handle sharing it has been closed. This is automatic,
 requires no setup, and applies within a single isolate/thread:
 
 ```ts
 import { Mmap } from "jsr:@nomadshiba/mmap";
 
 using a = await Mmap.open("data.bin");
-using b = await Mmap.open("data.bin"); // same file → same pointer, no second mmap() call
+using b = await Mmap.open("data.bin"); // same file → same pointer, no second map call
 a.pointer === b.pointer; // (well — same address; compare via Deno.UnsafePointer.value)
 ```
 
@@ -108,7 +108,7 @@ Opening the same path again with _different_ `write`/`offset`/`length` than an a
 actually want a second, independent mapping.
 
 A `Worker` is a separate V8 isolate with its own copy of this module's state, so the automatic, same-isolate sharing above is invisible between a main thread
-and its workers (each would still call `mmap()` itself, getting its own pointer). To share the exact same pointer across workers too, create an `MmapRegistry`,
+and its workers (each would still map the file itself, getting its own pointer). To share the exact same pointer across workers too, create an `MmapRegistry`,
 send its `.buffer` to each worker, and pass it as `{ registry }`:
 
 ```ts
