@@ -1,0 +1,13 @@
+{
+	"name": "@nomadshiba/mmap",
+	"version": "0.0.1",
+	"exports": "./mod.ts",
+	"tasks": {
+		"test": "deno test --allow-ffi --allow-read --allow-write"
+	},
+	"fmt": {
+		"lineWidth": 160,
+		"indentWidth": 4,
+		"useTabs": true
+	}
+}

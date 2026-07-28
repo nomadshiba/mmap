@@ -1,0 +1,27 @@
+{
+	"name": "Deno",
+	"image": "ghcr.io/bare-devcontainer/deno:2-trixie",
+	"remoteUser": "dev",
+	"runArgs": ["--cap-drop=ALL"],
+	"securityOpt": ["no-new-privileges"],
+	"init": true,
+	"mounts": [
+		{
+			"source": "${devcontainerId}-deno-cache",
+			"target": "/home/dev/.cache/deno",
+			"type": "volume"
+		}
+	],
+	"postCreateCommand": "deno install",
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"denoland.vscode-deno"
+			],
+			"settings": {
+				"deno.enable": true,
+				"deno.path": "/usr/local/bin/deno"
+			}
+		}
+	}
+}
