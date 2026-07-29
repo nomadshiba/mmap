@@ -1,6 +1,5 @@
 import { granularity, nativeAdvise, nativeMap, nativeSync, nativeUnmap, pageSize } from "./ffi.ts";
 import type { Advice } from "./constants.ts";
-import type { MmapRegistry } from "./registry.ts";
 
 /** Options for {@linkcode Mmap.open}. */
 export type MmapOptions = {
@@ -11,109 +10,50 @@ export type MmapOptions = {
 	write?: boolean;
 	/**
 	 * Byte offset into the file at which the mapping starts. May be unaligned —
-	 * alignment to the OS granularity is handled internally. Default `0`.
+	 * alignment to the OS granularity is handled internally, and the resulting view still starts
+	 * exactly here. Default `0`.
 	 */
-	offset?: number | bigint;
+	byteOffset?: number;
 	/**
-	 * Number of bytes to map. Default: the file size minus {@linkcode offset}.
+	 * How many bytes to map, starting at {@linkcode MmapOptions.byteOffset} — this becomes
+	 * {@linkcode Mmap.length}. Default: the rest of the file (after applying
+	 * {@linkcode MmapOptions.ensureFileSize}, if given).
 	 */
-	length?: number | bigint;
+	length?: number;
 	/**
 	 * Ensure the file is at least this many bytes, creating or extending it as
 	 * needed. Required when mapping a brand-new file. Only valid together with
 	 * `write: true` — throws otherwise.
 	 */
-	size?: number | bigint;
-	/**
-	 * Distinguishes this mapping from others of the *same file* that should
-	 * **not** share a pointer. By default (no `key`), every `open`/`openSync`
-	 * call for the same absolute file path — with matching `write`/`offset`/
-	 * `length` — hands back the *same* underlying mapping (same `pointer`,
-	 * same `bytes`/`view`, refcounted) instead of mapping the file again.
-	 * Passing a distinct `key` opts a call out of that sharing, giving it an
-	 * independent mapping of the same file.
-	 *
-	 * This sharing is automatic and requires no setup *within a single
-	 * isolate/thread*. To share the same pointer across `Worker` threads too,
-	 * also pass {@linkcode registry}.
-	 */
-	key?: string;
-	/**
-	 * A {@linkcode MmapRegistry} to additionally coordinate sharing *across*
-	 * `Worker` threads (each Worker is a separate isolate, so the default,
-	 * in-module sharing keyed on path + `key` alone is invisible between
-	 * them). Create one with `MmapRegistry.create()`, send its `.buffer` to
-	 * each worker, and reconstruct it there with `MmapRegistry.from(buffer)`.
-	 */
-	registry?: MmapRegistry;
+	ensureFileSize?: number;
 };
-
-/** The state shared by every {@linkcode Mmap} instance backed by the same underlying mapping. */
-type MappingHandle = {
-	base: Deno.PointerObject;
-	mapLength: bigint;
-	delta: bigint;
-	offset: bigint;
-	length: bigint;
-	bytes: Uint8Array;
-	view: DataView | null;
-	writable: boolean;
-	/** Number of live {@linkcode Mmap} instances (in *this* isolate) sharing this handle. */
-	refCount: number;
-	/** `` `${absolutePath}\0${key ?? ""}` `` — the dedup key used by {@linkcode localCache} and `registry`. */
-	mapKey: string;
-	/** Set if this handle was established via a {@linkcode MmapRegistry}, for cross-worker refcounting. */
-	registry: MmapRegistry | null;
-};
-
-// Per-isolate dedup cache: `Mmap.open`/`openSync` calls for the same (absolute path, key) within one
-// thread reuse the same handle for free, with no `registry` required. Separate Worker threads each
-// get their own copy of this module (and thus this Map) — see `MmapOptions.registry` for that case.
-const localCache = new Map<string, MappingHandle>();
 
 function alignDown(value: bigint, alignment: bigint): bigint {
 	return (value / alignment) * alignment;
 }
 
-/** The largest file size we're willing to hand to `Deno.truncate(Sync)`, which only accepts `number`. */
-function toTruncateLen(need: bigint): number {
-	if (need > BigInt(Number.MAX_SAFE_INTEGER)) {
-		throw new RangeError(`size ${need} exceeds Number.MAX_SAFE_INTEGER; cannot truncate to it`);
-	}
-	return Number(need);
-}
-
-/** The largest size the mapping needs the file to be, per `size`/`offset`/`length`. */
-function neededSize(offset: bigint, opts: MmapOptions): bigint {
-	let need = opts.size !== undefined ? BigInt(opts.size) : 0n;
-	if (opts.length !== undefined) {
-		const end = offset + BigInt(opts.length);
-		if (end > need) need = end;
-	}
-	return need;
-}
-
 function ensureFileSync(
 	path: string,
 	write: boolean,
-	opts: MmapOptions,
-): bigint {
+	options: MmapOptions,
+): number {
 	if (!write) {
-		if (opts.size !== undefined) {
-			throw new TypeError("the `size` option requires `write: true`");
+		if (options.ensureFileSize !== undefined) {
+			throw new TypeError("the `ensureFileSize` option requires `write: true`");
 		}
-		return BigInt(Deno.statSync(path).size);
+		return Deno.statSync(path).size;
 	}
 
-	// Create if absent, then extend to the largest size the mapping needs.
+	// Create if absent, then extend to `ensureFileSize` if given and larger.
 	Deno.openSync(path, { read: true, write: true, create: true }).close();
-	let size = BigInt(Deno.statSync(path).size);
+	let size = Deno.statSync(path).size;
 
-	const offset = BigInt(opts.offset ?? 0);
-	const need = neededSize(offset, opts);
-	if (need > size) {
-		Deno.truncateSync(path, toTruncateLen(need));
-		size = need;
+	if (options.ensureFileSize !== undefined) {
+		const need = options.ensureFileSize;
+		if (need > size) {
+			Deno.truncateSync(path, need);
+			size = need;
+		}
 	}
 	return size;
 }
@@ -121,28 +61,29 @@ function ensureFileSync(
 async function ensureFile(
 	path: string,
 	write: boolean,
-	opts: MmapOptions,
-): Promise<bigint> {
+	options: MmapOptions,
+): Promise<number> {
 	if (!write) {
-		if (opts.size !== undefined) {
-			throw new TypeError("the `size` option requires `write: true`");
+		if (options.ensureFileSize !== undefined) {
+			throw new TypeError("the `ensureFileSize` option requires `write: true`");
 		}
 		const stat = await Deno.stat(path);
-		return BigInt(stat.size);
+		return stat.size;
 	}
 
-	// Create if absent, then extend to the largest size the mapping needs.
+	// Create if absent, then extend to `ensureFileSize` if given and larger.
 	{
 		using _ = await Deno.open(path, { read: true, write: true, create: true });
 	}
 	const stat = await Deno.stat(path);
-	let size = BigInt(stat.size);
+	let size = stat.size;
 
-	const offset = BigInt(opts.offset ?? 0);
-	const need = neededSize(offset, opts);
-	if (need > size) {
-		await Deno.truncate(path, toTruncateLen(need));
-		size = need;
+	if (options.ensureFileSize !== undefined) {
+		const need = options.ensureFileSize;
+		if (need > size) {
+			await Deno.truncate(path, need);
+			size = need;
+		}
 	}
 	return size;
 }
@@ -150,40 +91,84 @@ async function ensureFile(
 /**
  * A live, zero-copy memory mapping of a file.
  *
- * The mapping stays valid until {@linkcode Mmap.close} is called (or the
- * instance is disposed by a `using` declaration). After that, the memory is
- * unmapped: **touching {@linkcode Mmap.bytes} or {@linkcode Mmap.view} past
- * that point is a use-after-free and will crash the process with a segfault,
- * not throw a catchable error.** Never let a captured view outlive the mapping.
+ * {@linkcode Mmap.bytes}, {@linkcode Mmap.view} and {@linkcode Mmap.buffer} each build a *fresh*
+ * object per call, all over the same memory. Nothing is cached, so grab one and reuse it within a
+ * scope instead of calling per byte in a loop.
  *
- * Two more crash risks beyond `close()`, neither of which is a catchable JS
- * error:
- * - **Writing through a read-only mapping** (`writable === false`) touches a
- *   `PROT_READ`-only page and segfaults immediately.
- * - **Another process truncating the file out from under an active mapping**
- *   raises `SIGBUS` the next time a now-invalid page is touched. This applies
- *   to any mapping of that file, including read-only ones.
+ * Every {@linkcode Mmap.open}/{@linkcode Mmap.openSync} call maps the file independently — no
+ * sharing or deduplication between calls, even for the same path. Two mappings of one file get two
+ * pointers, but both are `MAP_SHARED` views of the same page cache, so they are *the same physical
+ * memory*: a store through one is visible through the other immediately, with no
+ * {@linkcode Mmap.flush} in between, and the file's data is held in RAM once regardless of how many
+ * times you map it. That holds for read-only mappings, overlapping windows, other processes, and
+ * plain `read()`/`write()` on the same file too.
+ *
+ * ### Sharing one mapping with a `Worker`
+ *
+ * Transferring a `buffer()` (`postMessage(buf, [buf])`) hands the worker *these pages*, not a copy:
+ * the structured-clone transfer moves the backing store, which points at the mapping. Whatever the
+ * worker writes, this thread reads back from a fresh `bytes()` — live, in both directions. It is
+ * effectively a file-backed `SharedArrayBuffer`.
+ *
+ * Transferring detaches only that one `ArrayBuffer` object in this isolate. The `Mmap` is untouched,
+ * so `bytes()`/`view()`/`buffer()` keep working afterwards.
+ *
+ * The only rule is lifetime: {@linkcode Mmap.close} unmaps the pages for the *whole process*, so it
+ * must not run while any thread still holds a transferred buffer. Have the worker acknowledge that
+ * it's done before you close.
+ *
+ * ### Ways to crash — none of them catchable
+ *
+ * These are immediate `SIGSEGV`/`SIGBUS`, not JS errors you can `try`/`catch`:
+ *
+ * - **Use after close.** Touching a `bytes()`/`view()`/`buffer()` result once the mapping is closed
+ *   (or its `using` scope ended) is a use-after-free. Includes a buffer you transferred to a worker.
+ * - **Writing through a read-only mapping** (`writable === false`) hits a `PROT_READ`-only page.
+ * - **Another process truncating the file** below the mapped range raises `SIGBUS` on the next touch
+ *   of a now-invalid page — read-only mappings included.
  */
 export class Mmap {
-	#handle: MappingHandle | null;
+	// `#base` doubles as the "closed?" sentinel: nulled by `close()`, checked by every accessor below.
+	#base: Deno.PointerValue;
+	#mapLength: bigint; // length of the raw, granularity-aligned mapping — what nativeUnmap needs.
+	#delta: number; // `pointer` is `#base` shifted forward by this many bytes.
 
 	/** Whether the mapping was opened read-write. */
 	readonly writable: boolean;
 
+	/**
+	 * Length of the mapped view, in bytes. Unlike {@linkcode Mmap.bytes}/{@linkcode Mmap.view}/
+	 * {@linkcode Mmap.buffer}, this is plain data fixed at open time, not a live memory access — so
+	 * it stays valid (and correct) even after {@linkcode Mmap.close}.
+	 */
+	readonly length: number;
+
+	#pointer: Deno.PointerValue;
+
+	/**
+	 * A pointer to the first byte of the view, for handing the mapped memory to other FFI calls.
+	 * Computed once at open time — like {@linkcode Mmap.length}, reading it doesn't touch memory, so
+	 * it's plain data, not a method. Unlike `length` though, {@linkcode Mmap.close} sets this to
+	 * `null` (the address is meaningless once unmapped) — that's why it's typed
+	 * {@linkcode Deno.PointerValue} rather than the non-nullable `PointerObject`, and callers must
+	 * null-check it themselves.
+	 */
+	get pointer(): Deno.PointerValue {
+		return this.#pointer;
+	}
+
 	/** @internal — use {@linkcode Mmap.openSync} or {@linkcode Mmap.open} to construct. */
-	private constructor(handle: MappingHandle) {
-		this.#handle = handle;
-		this.writable = handle.writable;
+	private constructor(base: Deno.PointerObject, mapLength: bigint, delta: number, length: number, writable: boolean) {
+		this.#base = base;
+		this.#mapLength = mapLength;
+		this.#delta = delta;
+		this.length = length;
+		this.writable = writable;
+		this.#pointer = Deno.UnsafePointer.offset(base, delta);
 	}
 
 	/**
 	 * Memory-map a file and return a zero-copy {@linkcode Mmap} handle.
-	 *
-	 * By default, mapping the same absolute file path again (with matching
-	 * `write`/`offset`/`length`) — whether from a fresh call or one still open
-	 * — hands back the *same* pointer instead of mapping the file a second
-	 * time; see {@linkcode MmapOptions.key} to opt out, and
-	 * {@linkcode MmapOptions.registry} to extend this across `Worker` threads.
 	 *
 	 * @param path Filesystem path to the file.
 	 * @param options See {@linkcode MmapOptions}.
@@ -192,7 +177,8 @@ export class Mmap {
 	 * ```ts
 	 * import { Mmap } from "@nomadshiba/mmap";
 	 * using f = Mmap.openSync("data.bin");
-	 * const first = f.bytes[0];
+	 * const bytes = f.bytes();
+	 * const first = bytes[0];
 	 * ```
 	 */
 	static openSync(path: string, options: MmapOptions = {}): Mmap {
@@ -205,12 +191,6 @@ export class Mmap {
 	/**
 	 * Memory-map a file and return a zero-copy {@linkcode Mmap} handle.
 	 *
-	 * By default, mapping the same absolute file path again (with matching
-	 * `write`/`offset`/`length`) — whether from a fresh call or one still open
-	 * — hands back the *same* pointer instead of mapping the file a second
-	 * time; see {@linkcode MmapOptions.key} to opt out, and
-	 * {@linkcode MmapOptions.registry} to extend this across `Worker` threads.
-	 *
 	 * @param path Filesystem path to the file.
 	 * @param options See {@linkcode MmapOptions}.
 	 *
@@ -218,162 +198,80 @@ export class Mmap {
 	 * ```ts
 	 * import { Mmap } from "@nomadshiba/mmap";
 	 * using f = await Mmap.open("data.bin");
-	 * const first = f.bytes[0];
+	 * const bytes = f.bytes();
+	 * const first = bytes[0];
 	 * ```
 	 */
 	static async open(path: string, options: MmapOptions = {}): Promise<Mmap> {
-		const write = options.write ?? false;
-		const fileSize = await ensureFile(path, write, options);
+		const writable = options.write ?? false;
+		const fileSize = await ensureFile(path, writable, options);
 		const absolutePath = await Deno.realPath(path);
-		return Mmap.#open(absolutePath, write, fileSize, options);
+		return Mmap.#open(absolutePath, writable, fileSize, options);
 	}
 
 	// Shared tail end of openSync/open — the only difference between them is how
-	// `fileSize`/`absolutePath` were obtained (sync vs. async). Resolves an
-	// existing handle to share (local cache, then `options.registry`) or maps
-	// the file fresh.
-	static #open(absolutePath: string, write: boolean, fileSize: bigint, options: MmapOptions): Mmap {
-		const offset = BigInt(options.offset ?? 0);
-		if (offset < 0n) throw new RangeError("offset must be >= 0");
+	// `fileSize`/`absolutePath` were obtained (sync vs. async).
+	static #open(absolutePath: string, writable: boolean, fileSize: number, options: MmapOptions): Mmap {
+		const size = BigInt(fileSize);
 
-		const length = options.length !== undefined ? BigInt(options.length) : fileSize - offset;
-		if (length <= 0n) {
-			throw new RangeError("length must be > 0 (nothing to map)");
-		}
-		if (!write && offset + length > fileSize) {
-			throw new RangeError(`mapping [${offset}, ${offset + length}) exceeds file size ${fileSize}`);
+		const byteOffset = BigInt(options.byteOffset ?? 0);
+		if (byteOffset < 0n) throw new RangeError("byteOffset must be >= 0");
+		if (byteOffset > size) {
+			throw new RangeError(`byteOffset ${byteOffset} is past the end of the file (size ${fileSize})`);
 		}
 
-		const mapKey = `${absolutePath}\0${options.key ?? ""}`;
-
-		const cached = localCache.get(mapKey);
-		if (cached) {
-			Mmap.#assertCompatible(mapKey, cached, write, offset, length);
-			cached.refCount++;
-			return new Mmap(cached);
+		// Default to the rest of the file. `fileSize` already reflects `ensureFileSize`'s growth, if
+		// any — `length` doesn't get to grow the file further, it just has to fit.
+		const length = options.length !== undefined ? BigInt(options.length) : size - byteOffset;
+		if (length <= 0n) throw new RangeError("length must be > 0 (nothing to map)");
+		if (byteOffset + length > size) {
+			throw new RangeError(`mapping [${byteOffset}, ${byteOffset + length}) exceeds file size ${fileSize}`);
 		}
 
-		const registry = options.registry ?? null;
-		if (!registry) {
-			const handle = Mmap.#map(absolutePath, mapKey, write, offset, length, null);
-			localCache.set(mapKey, handle);
-			return new Mmap(handle);
-		}
-
-		const acquired = registry.acquire(mapKey);
-		if (!acquired.hit) {
-			let handle: MappingHandle;
-			try {
-				handle = Mmap.#map(absolutePath, mapKey, write, offset, length, registry);
-			} catch (e) {
-				registry.abort(acquired.slot);
-				throw e;
-			}
-			registry.publish(acquired.slot, {
-				pointer: Deno.UnsafePointer.value(handle.base),
-				mapLength: handle.mapLength,
-				delta: handle.delta,
-				offset: handle.offset,
-				length: handle.length,
-				writable: write,
-			});
-			localCache.set(mapKey, handle);
-			return new Mmap(handle);
-		}
-
-		const { entry } = acquired;
-		if (entry.writable !== write || entry.offset !== offset || entry.length !== length) {
-			registry.release(mapKey); // undo the refcount bump acquire() already made
-			throw Mmap.#incompatibleError(mapKey);
-		}
-		const base = Deno.UnsafePointer.create(entry.pointer) as Deno.PointerObject;
-		const buffer = Deno.UnsafePointerView.getArrayBuffer(base, Number(entry.mapLength));
-		const bytes = new Uint8Array(buffer, Number(entry.delta), Number(entry.length));
-		const handle: MappingHandle = {
-			base,
-			mapLength: entry.mapLength,
-			delta: entry.delta,
-			offset,
-			length,
-			bytes,
-			view: null,
-			writable: write,
-			refCount: 1,
-			mapKey,
-			registry,
-		};
-		localCache.set(mapKey, handle);
-		return new Mmap(handle);
-	}
-
-	// Actually calls mmap()/MapViewOfFile — only reached on a cache/registry miss.
-	static #map(
-		absolutePath: string,
-		mapKey: string,
-		write: boolean,
-		offset: bigint,
-		length: bigint,
-		registry: MmapRegistry | null,
-	): MappingHandle {
-		// Align the file offset down to the OS granularity; carry the remainder into
-		// the view's byteOffset so the returned bytes start exactly at `offset`.
-		const g = BigInt(granularity);
-		const alignedOffset = alignDown(offset, g);
-		const delta = offset - alignedOffset;
+		// Align the offset down to the OS granularity; carry the remainder into the view's own
+		// byteOffset so the returned bytes still start exactly at `byteOffset`.
+		const delta = byteOffset - alignDown(byteOffset, granularity);
+		const alignedStart = byteOffset - delta;
 		const mapLength = length + delta;
 
-		const base = nativeMap(absolutePath, alignedOffset, mapLength, write);
-		const buffer = Deno.UnsafePointerView.getArrayBuffer(base, Number(mapLength));
-		const bytes = new Uint8Array(buffer, Number(delta), Number(length));
-
-		return { base, mapLength, delta, offset, length, bytes, view: null, writable: write, refCount: 1, mapKey, registry };
-	}
-
-	static #incompatibleError(mapKey: string): Error {
-		const [path] = mapKey.split("\0");
-		return new Error(
-			`Mmap: ${path} is already mapped with different write/offset/length options. ` +
-				`Pass a distinct \`key\` to create an independent mapping of the same file.`,
-		);
-	}
-
-	static #assertCompatible(mapKey: string, handle: MappingHandle, write: boolean, offset: bigint, length: bigint): void {
-		if (handle.writable !== write || handle.offset !== offset || handle.length !== length) {
-			throw Mmap.#incompatibleError(mapKey);
-		}
+		const base = nativeMap(absolutePath, alignedStart, mapLength, writable);
+		return new Mmap(base, mapLength, Number(delta), Number(length), writable);
 	}
 
 	/**
-	 * The mapped bytes as a zero-copy {@linkcode Uint8Array}. Reads and writes go
-	 * straight to the file's pages. Invalid once {@linkcode Mmap.close} runs.
+	 * A fresh, zero-copy {@linkcode ArrayBuffer} over the mapped bytes. Reads and writes go straight
+	 * to the file's pages. Invalid once {@linkcode Mmap.close} runs.
+	 *
+	 * Every call returns a *new* object, so transferring one to a `Worker` detaches only that object
+	 * and leaves the `Mmap` usable. The worker then shares these pages — see the class docs.
 	 */
-	get bytes(): Uint8Array {
-		if (!this.#handle) throw new Error("Mmap is closed");
-		return this.#handle.bytes;
-	}
-
-	/** Length of the mapped view, in bytes. */
-	get length(): number {
-		return this.bytes.length;
-	}
-
-	/** A {@linkcode DataView} over the same zero-copy memory. */
-	get view(): DataView {
-		const handle = this.#handle;
-		if (!handle) throw new Error("Mmap is closed");
-		if (handle.view) return handle.view;
-		const b = handle.bytes;
-		return handle.view = new DataView(b.buffer, b.byteOffset, b.byteLength);
+	buffer(): ArrayBuffer {
+		if (!this.#pointer) throw new Error("Mmap is closed");
+		return Deno.UnsafePointerView.getArrayBuffer(this.#pointer, this.length);
 	}
 
 	/**
-	 * A pointer to the first byte of the view, for handing the mapped memory to
-	 * other FFI calls. Shared mappings (see {@linkcode MmapOptions.key}) return
-	 * the identical pointer value for every handle sharing them.
+	 * A fresh, zero-copy {@linkcode Uint8Array} over the mapped bytes. See {@linkcode Mmap.buffer} —
+	 * every call returns an independent `Uint8Array` over its own fresh `ArrayBuffer`.
+	 *
+	 * @example
+	 * ```ts
+	 * import { Mmap } from "@nomadshiba/mmap";
+	 * using m = await Mmap.open("out.bin", { write: true, ensureFileSize: 256 });
+	 * const bytes = m.bytes(); // once, then reuse
+	 * for (let i = 0; i < 256; i++) bytes[i] = i;
+	 * ```
 	 */
-	get pointer(): Deno.PointerValue {
-		if (!this.#handle) throw new Error("Mmap is closed");
-		return Deno.UnsafePointer.offset(this.#handle.base, Number(this.#handle.delta));
+	bytes(): Uint8Array {
+		return new Uint8Array(this.buffer());
+	}
+
+	/**
+	 * A fresh {@linkcode DataView} over the mapped bytes. See {@linkcode Mmap.buffer} — every call
+	 * returns an independent `DataView` over its own fresh `ArrayBuffer`.
+	 */
+	view(): DataView {
+		return new DataView(this.buffer());
 	}
 
 	/**
@@ -389,6 +287,11 @@ export class Mmap {
 	 * Flush modified pages in a sub-range to disk (`msync(MS_SYNC)` on POSIX,
 	 * `FlushViewOfFile` on Windows). `offset`/`length` are relative to this view.
 	 *
+	 * This is about **durability only**. You do not need it for anything else to *see* your writes:
+	 * other mappings of the file, other threads, other processes, and plain `read()` calls all go
+	 * through the same page cache and observe stores immediately. Flush when you want the bytes to
+	 * survive a crash or power loss.
+	 *
 	 * This is a *blocking* FFI call — for large dirty ranges it can stall the
 	 * event loop for the duration of the disk write.
 	 */
@@ -400,8 +303,7 @@ export class Mmap {
 	// Translate a view-relative range into a page-aligned (pointer, length),
 	// since msync/madvise require a page-aligned start address on POSIX.
 	#alignedRange(offset: number, length?: number): [Deno.PointerValue, bigint] {
-		const handle = this.#handle;
-		if (!handle) throw new Error("Mmap is closed");
+		if (!this.#base) throw new Error("Mmap is closed");
 		const viewLen = this.length;
 		if (offset < 0 || offset > viewLen) {
 			throw new RangeError("offset out of bounds");
@@ -410,38 +312,25 @@ export class Mmap {
 		if (len < 0 || offset + len > viewLen) {
 			throw new RangeError("length out of bounds");
 		}
-		const abs = handle.delta + BigInt(offset); // position within the mapping
-		const start = alignDown(abs, BigInt(pageSize));
-		const alignedLen = (abs - start) + BigInt(len);
-		return [Deno.UnsafePointer.offset(handle.base, Number(start)), alignedLen];
+		const abs = BigInt(this.#delta + offset); // position within the mapping
+		const start = alignDown(abs, pageSize);
+		const alignedLen = abs - start + BigInt(len);
+		return [Deno.UnsafePointer.offset(this.#base, Number(start)), alignedLen];
 	}
 
 	/**
-	 * Release this handle's reference to the mapping. Idempotent.
+	 * Unmap the file and release this handle. Idempotent.
 	 *
-	 * If other {@linkcode Mmap} handles still share the same underlying
-	 * mapping (see {@linkcode MmapOptions.key}) — in this isolate, or in
-	 * another `Worker` via {@linkcode MmapOptions.registry} — the memory
-	 * stays mapped for them and only this handle's `bytes`/`view` become
-	 * invalid. It's only actually unmapped once every sharing handle,
-	 * everywhere, has called `close()`. See the class-level warning.
+	 * This `munmap()`s the pages for the whole process. Nothing, on any thread, may still be holding a
+	 * {@linkcode Mmap.bytes}/{@linkcode Mmap.view}/{@linkcode Mmap.buffer} result — including a buffer
+	 * transferred to a `Worker` — or the next touch segfaults.
 	 */
 	close(): void {
-		const handle = this.#handle;
-		if (!handle) return;
-		this.#handle = null;
-
-		handle.refCount--;
-		if (handle.refCount > 0) return;
-
-		localCache.delete(handle.mapKey);
-
-		if (handle.registry) {
-			// Other workers may still hold this mapping — only unmap once the registry
-			// confirms we were the last reference anywhere, not just in this isolate.
-			if (!handle.registry.release(handle.mapKey)) return;
-		}
-		nativeUnmap(handle.base, handle.mapLength);
+		const base = this.#base;
+		if (!base) return;
+		this.#base = null;
+		this.#pointer = null;
+		nativeUnmap(base, this.#mapLength);
 	}
 
 	/** Disposes the mapping, enabling `using` declarations. */

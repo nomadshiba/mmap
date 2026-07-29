@@ -156,30 +156,30 @@ type WinSymbols = ReturnType<typeof openWin>["symbols"];
 
 let posix: PosixSymbols | null = null;
 let win: WinSymbols | null = null;
-let _pageSize = 4096;
-let _granularity = 4096;
+let _pageSize = 4096n;
+let _granularity = 4096n;
 
 if (os === "windows") {
 	win = openWin().symbols;
 	const si = new Uint8Array(64); // SYSTEM_INFO is 48 bytes on 64-bit
 	win.GetSystemInfo(Deno.UnsafePointer.of(si));
 	const dv = new DataView(si.buffer);
-	_pageSize = dv.getUint32(4, true); // dwPageSize
-	_granularity = dv.getUint32(40, true); // dwAllocationGranularity
+	_pageSize = BigInt(dv.getUint32(4, true)); // dwPageSize
+	_granularity = BigInt(dv.getUint32(40, true)); // dwAllocationGranularity
 } else {
 	posix = openPosix().symbols;
-	_pageSize = posix.getpagesize();
+	_pageSize = BigInt(posix.getpagesize());
 	_granularity = _pageSize;
 }
 
 /** OS page size in bytes (e.g. 4096, or 16384 on Apple Silicon). */
-export const pageSize: number = _pageSize;
+export const pageSize: bigint = _pageSize;
 
 /**
  * Required alignment for a mapping's file offset: the page size on POSIX, the
  * allocation granularity (usually 65536) on Windows.
  */
-export const granularity: number = _granularity;
+export const granularity: bigint = _granularity;
 
 // ---------------------------------------------------------------------------
 // native operations (platform-dispatched)
