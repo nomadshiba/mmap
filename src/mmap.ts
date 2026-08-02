@@ -22,8 +22,7 @@ export type MmapOptions = {
 	length?: number;
 	/**
 	 * Ensure the file is at least this many bytes, creating or extending it as
-	 * needed. Required when mapping a brand-new file. Only valid together with
-	 * `write: true` — throws otherwise.
+	 * needed. Required when mapping a brand-new file.
 	 */
 	ensureFileSize?: number;
 };
