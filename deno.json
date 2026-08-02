@@ -1,6 +1,6 @@
 {
 	"name": "@nomadshiba/mmap",
-	"version": "0.0.6",
+	"version": "0.0.7",
 	"exports": "./mod.ts",
 	"publish": {
 		"exclude": [".devcontainer", "test"]

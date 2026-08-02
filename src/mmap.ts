@@ -32,60 +32,26 @@ function alignDown(value: bigint, alignment: bigint): bigint {
 	return (value / alignment) * alignment;
 }
 
-function ensureFileSync(
-	path: string,
-	write: boolean,
-	options: MmapOptions,
-): number {
-	if (!write) {
-		if (options.ensureFileSize !== undefined) {
-			throw new TypeError("the `ensureFileSize` option requires `write: true`");
-		}
-		return Deno.statSync(path).size;
+function ensureFileSync(path: string, size: number): number {
+	const file = Deno.openSync(path, { read: true, write: true, create: true });
+	const stat = file.statSync();
+	file.close();
+	if (size > stat.size) {
+		Deno.truncateSync(path, size);
+		return size;
 	}
-
-	// Create if absent, then extend to `ensureFileSize` if given and larger.
-	Deno.openSync(path, { read: true, write: true, create: true }).close();
-	let size = Deno.statSync(path).size;
-
-	if (options.ensureFileSize !== undefined) {
-		const need = options.ensureFileSize;
-		if (need > size) {
-			Deno.truncateSync(path, need);
-			size = need;
-		}
-	}
-	return size;
+	return stat.size;
 }
 
-async function ensureFile(
-	path: string,
-	write: boolean,
-	options: MmapOptions,
-): Promise<number> {
-	if (!write) {
-		if (options.ensureFileSize !== undefined) {
-			throw new TypeError("the `ensureFileSize` option requires `write: true`");
-		}
-		const stat = await Deno.stat(path);
-		return stat.size;
+async function ensureFile(path: string, size: number): Promise<number> {
+	const file = await Deno.open(path, { read: true, write: true, create: true });
+	const stat = await file.stat();
+	file.close();
+	if (size > stat.size) {
+		await Deno.truncate(path, size);
+		return size;
 	}
-
-	// Create if absent, then extend to `ensureFileSize` if given and larger.
-	{
-		using _ = await Deno.open(path, { read: true, write: true, create: true });
-	}
-	const stat = await Deno.stat(path);
-	let size = stat.size;
-
-	if (options.ensureFileSize !== undefined) {
-		const need = options.ensureFileSize;
-		if (need > size) {
-			await Deno.truncate(path, need);
-			size = need;
-		}
-	}
-	return size;
+	return stat.size;
 }
 
 /**
@@ -183,7 +149,7 @@ export class Mmap {
 	 */
 	static openSync(path: string, options: MmapOptions = {}): Mmap {
 		const write = options.write ?? false;
-		const fileSize = ensureFileSync(path, write, options);
+		const fileSize = ensureFileSync(path, options.ensureFileSize ?? 0);
 		const absolutePath = Deno.realPathSync(path);
 		return Mmap.#open(absolutePath, write, fileSize, options);
 	}
@@ -204,7 +170,7 @@ export class Mmap {
 	 */
 	static async open(path: string, options: MmapOptions = {}): Promise<Mmap> {
 		const writable = options.write ?? false;
-		const fileSize = await ensureFile(path, writable, options);
+		const fileSize = await ensureFile(path, options.ensureFileSize ?? 0);
 		const absolutePath = await Deno.realPath(path);
 		return Mmap.#open(absolutePath, writable, fileSize, options);
 	}
