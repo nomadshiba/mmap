@@ -1,3 +1,13 @@
+> [!IMPORTANT]
+> **This repo is moving to Nostr.** GitHub will stay as a mirror. New issues and patches go there.
+>
+> - Browse: [gitworkshop.dev/nomadshiba.me/mmap](https://gitworkshop.dev/nomadshiba.me/mmap)
+> - Clone: `git clone nostr://nomadshiba.me/mmap`
+>
+> To clone `nostr://` URLs and send patches, install [ngit](https://ngit.dev). It's git collaboration over Nostr, with no accounts and no platform.
+>
+> <sub>If NIP-05 doesn't resolve: [gitworkshop (npub)](https://gitworkshop.dev/npub1gkp4cdh5rktehjqjnqc09awey4302dpadlka6mes4fu5spes7fhqfsppqk/mmap) · `nostr://npub1gkp4cdh5rktehjqjnqc09awey4302dpadlka6mes4fu5spes7fhqfsppqk/mmap`</sub>
+
 # @nomadshiba/mmap
 
 Zero-copy memory-mapped file I/O for **Deno**, via FFI — **no native addon and no prebuilt binary**. It binds the platform's own C library directly: `libc`
